@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Insight8x8 — AI-powered chess analysis</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div id="app">
+    <section id="landing" class="landing">
+      <div class="landing-card">
+        <div class="brand"><span class="brand-mark">8×8</span> Insight8x8</div>
+        <h1 class="hero">Your chess, <span>understood.</span></h1>
+        <p class="lead">Explore your Chess.com games, uncover mistakes with local Stockfish analysis, and turn recurring errors into personalised lessons and exercises.</p>
+        <div class="connect-box">
+          <label for="username-input">Chess.com username</label>
+          <div class="connect-row">
+            <input id="username-input" type="text" placeholder="e.g. hikaru" autocomplete="username" spellcheck="false">
+            <button id="connect-button" class="primary">Analyze my games</button>
+          </div>
+          <p class="hint">Public username only — no password, API key or account linking required.</p>
+          <p id="landing-status" class="status-line"></p>
+        </div>
+        <div class="landing-foot">
+          <button id="landing-settings" class="ghost">Engine &amp; coaching settings</button>
+          <div class="feature-list">
+            <span>Move-by-move replay</span><span>Stockfish analysis</span><span>Personal coaching</span><span>Progress tracking</span>
+          </div>
+        </div>
+      </div>
+      <div class="landing-art" aria-hidden="true">
+        <div class="mini-board" id="mini-board"></div>
+      </div>
+    </section>
+
+    <div id="dashboard" class="dashboard hidden">
+      <aside class="sidebar">
+        <div class="sidebar-head">
+          <div class="avatar" id="profile-avatar">8×8</div>
+          <div>
+            <div class="profile-name" id="profile-name">—</div>
+            <div class="muted small" id="profile-meta">—</div>
+          </div>
+        </div>
+        <nav id="nav" class="nav">
+          <button data-tab="overview" class="active">◫ Overview</button>
+          <button data-tab="games">▤ Match history</button>
+          <button data-tab="openings">◈ Openings</button>
+          <button data-tab="compare">⇄ Compare</button>
+          <button data-tab="favorites">★ Favorites</button>
+          <button data-tab="training">✦ Training</button>
+          <button data-tab="progress">↗ Progress</button>
+          <button data-tab="export">⇩ Export</button>
+        </nav>
+        <div class="sidebar-foot">
+          <div class="engine-card">
+            <div class="section-label">Engine</div>
+            <div id="engine-status" class="engine-status">—</div>
+            <div class="muted small" id="engine-detail"></div>
+          </div>
+          <button id="open-settings" class="ghost wide">Engine settings</button>
+          <button id="change-account" class="ghost wide">Change account</button>
+          <div class="muted tiny" id="db-path"></div>
+        </div>
+      </aside>
+      <main class="main">
+        <header class="topbar">
+          <h2 id="page-title">Overview</h2>
+          <div class="topbar-actions">
+            <span id="app-status" class="status-line"></span>
+            <button id="refresh-button" class="ghost small">↻ Refresh archives</button>
+          </div>
+        </header>
+        <div id="tab-content" class="tab-content"></div>
+      </main>
+    </div>
+
+    <div id="game-modal" class="modal hidden">
+      <div class="modal-backdrop" data-close="game"></div>
+      <div class="modal-panel game-panel">
+        <header class="game-head">
+          <div>
+            <h3 id="game-title">Game</h3>
+            <div id="game-subtitle" class="muted small"></div>
+          </div>
+          <div class="row gap">
+            <button id="game-favorite" class="ghost small">☆ Save</button>
+            <a id="game-link" class="ghost small" href="#" target="_blank" rel="noopener">Chess.com ↗</a>
+            <button class="ghost small" data-close="game">Close</button>
+          </div>
+        </header>
+        <div class="game-body">
+          <div class="game-left">
+            <div id="board" class="board"></div>
+            <div class="board-controls">
+              <button data-move="first" class="ghost small">⏮ First</button>
+              <button data-move="prev" class="ghost small">◀ Prev</button>
+              <button data-move="play" class="ghost small" id="play-button">▶ Play</button>
+              <button data-move="next" class="ghost small">Next ▶</button>
+              <button data-move="last" class="ghost small">Last ⏭</button>
+              <button data-move="flip" class="ghost small">⇅ Flip</button>
+            </div>
+            <input id="ply-slider" type="range" min="0" max="0" value="0">
+            <div id="move-status" class="status-line"></div>
+            <div id="captured" class="muted small"></div>
+          </div>
+          <div class="game-right">
+            <section class="panel">
+              <div class="section-label">Moves</div>
+              <div id="move-list" class="move-list"></div>
+            </section>
+            <section class="panel analysis-panel">
+              <div class="section-label">Analysis</div>
+              <div id="analysis-area" class="analysis-area"></div>
+            </section>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div id="settings-modal" class="modal hidden">
+      <div class="modal-backdrop" data-close="settings"></div>
+      <div class="modal-panel settings-panel">
+        <header class="game-head"><h3>Engine &amp; coaching settings</h3><button class="ghost small" data-close="settings">Close</button></header>
+        <div class="settings-grid">
+          <label>Stockfish executable<input id="setting-engine" type="text" placeholder="Auto-detect from PATH or paste full path"></label>
+          <label>Search depth<input id="setting-depth" type="number" min="4" max="20" value="12"></label>
+          <label>Time per position (ms)<input id="setting-movetime" type="number" min="50" max="3000" step="50" value="150"></label>
+          <label>LLM endpoint (optional)<input id="setting-llm-url" type="text" placeholder="OpenAI-compatible chat completions URL"></label>
+          <label>LLM model<input id="setting-llm-model" type="text" placeholder="gpt-4o-mini"></label>
+          <label>LLM API key (session only)<input id="setting-llm-key" type="password" autocomplete="off" placeholder="Never stored in the local database"></label>
+        </div>
+        <div class="row gap end">
+          <span id="settings-status" class="status-line"></span>
+          <button id="save-settings" class="primary">Save settings</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="toast" class="toast hidden"></div>
+  </div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
