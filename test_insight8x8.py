@@ -22,11 +22,14 @@ from coaching import (
     GROQ_MODEL,
     GROQ_URL,
     LLMCoach,
+    check_opening_book_with_llm,
+    explain_position_with_coach,
     generate_lessons,
     improvement_summary,
     load_env_file,
     progress_history,
     record_progress,
+    softened_classification,
     training_report,
 )
 from insight8x8 import compute_insights
@@ -42,12 +45,15 @@ from engine import (
 from intelligence import (
     classify_loss_for_rating,
     explain_positional_mistake,
+    is_common_opening_move,
+    move_lesson,
+    position_factors,
     recurring_weaknesses,
     tactical_motifs,
     why_is_better,
 )
 from store import Store
-from ui_widgets import captured_pieces
+from ui_widgets import EvalBar, captured_pieces
 from utils import csv_safe, filter_game_details, fmt_date, game_matches_filters
 
 
@@ -103,6 +109,8 @@ class Insight8x8Tests(unittest.TestCase):
         self.assertEqual(summary["moves"], 3)
         self.assertEqual(summary["accuracy"], 91.12)
         self.assertEqual(summary["opponentAccuracy"], 83.37)
+        self.assertEqual(summary["whiteAccuracy"], 91.12)
+        self.assertEqual(summary["blackAccuracy"], 83.37)
         self.assertTrue(summary["supported"])
 
     def test_game_id_fallback_is_stable(self):
@@ -613,6 +621,69 @@ class IntelligenceAndCoachingTests(unittest.TestCase):
         self.assertEqual(coach.model, GROQ_MODEL)
         self.assertTrue(coach.available)
 
+    def test_position_factors_and_book_recognition(self):
+        fen = "4k3/8/8/8/8/8/4P3/4K3 w - - 0 1"
+        self.assertTrue(position_factors(fen))
+        book = is_common_opening_move(
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "e2e4",
+            "Italian Game",
+            "C50",
+            1,
+        )
+        self.assertTrue(book["book"])
+        self.assertIn("e4", book["explanation"])
+        entry = {"classification": "blunder", "explanation": "Original note"}
+        changes = softened_classification(entry, book)
+        self.assertEqual(changes["classification"], "best or good")
+        self.assertEqual(changes["originalClassification"], "blunder")
+
+    def test_move_lesson_builds_concrete_auto_explanation_and_arrows(self):
+        entry = {
+            "ply": 5,
+            "move": "O-O",
+            "playedMove": "e1g1",
+            "fen": "4k3/8/8/3b4/8/8/4P3/4K2R w K - 0 1",
+            "bestMove": "e2e4",
+            "bestMoveSan": "e4",
+            "classification": "mistake",
+            "candidates": [{"pvUci": ["e2e4", "d5e6"], "san": "e4"}],
+        }
+        lesson = move_lesson(entry)
+        self.assertIsNotNone(lesson)
+        self.assertIn("Castling", lesson["headline"])
+        self.assertIn("bishop", lesson["body"].lower())
+        self.assertIn("e4", lesson["body"])
+        self.assertEqual(lesson["arrows"][0], {"from": "e2", "to": "e4", "kind": "best"})
+        self.assertEqual(lesson["arrows"][1]["kind"], "threat")
+        self.assertIn("d5", lesson["focus"])
+
+    def test_coach_explains_without_raw_scores(self):
+        text = explain_position_with_coach(None, {"fen": "4k3/8/8/8/8/8/4P3/4K3 w - - 0 1"})
+        self.assertNotIn("centipawn", text.lower())
+        self.assertTrue(text)
+        with patch.object(LLMCoach, "available", new_callable=lambda: property(lambda self: True)):
+            coach = LLMCoach(url="https://example.test", key="test-key")
+        with patch.object(coach, "generate", return_value="Your king needs more pawn cover."):
+            text = explain_position_with_coach(coach, {"fen": "4k3/8/8/8/8/8/4P3/4K3 w - - 0 1"})
+        self.assertIn("king", text)
+
+    def test_llm_book_check_falls_back_to_local(self):
+        context = {
+            "fen": "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "uci": "e2e4",
+            "san": "e4",
+            "opening": "Italian Game",
+            "eco": "C50",
+            "ply": 1,
+        }
+        result = check_opening_book_with_llm(None, context)
+        self.assertTrue(result["book"])
+        coach = LLMCoach(url="https://example.test", key="test-key")
+        with patch.object(coach, "generate", return_value='{"book": true, "name": "Open Game", "explanation": "Standard central move."}'):
+            result = check_opening_book_with_llm(coach, context)
+        self.assertEqual(result["source"], "LLM")
+
     def test_env_file_values_are_loaded_without_overwriting(self):
         with tempfile.TemporaryDirectory() as directory:
             from pathlib import Path
@@ -765,6 +836,63 @@ class Insight8x8GuiTests(unittest.TestCase):
             self.assertEqual(window.page_title.text(), "Progress")
             report = window._export_text("training_report")
             self.assertIn("Insight8x8 training report", report)
+        finally:
+            window.close()
+
+    def test_eval_bar_reflects_white_advantage(self):
+        bar = EvalBar()
+        bar.set_evaluation({"cp": 300}, "white")
+        self.assertGreater(bar._white_share(), 0.5)
+        self.assertEqual(bar.orientation, "white")
+        bar.set_evaluation({"mate": -2}, "black")
+        self.assertAlmostEqual(bar._white_share(), 0.03)
+        self.assertEqual(bar.orientation, "black")
+
+    def test_viewer_orients_board_to_player_and_hides_raw_scores(self):
+        from viewers import GameViewerDialog
+
+        window = self.make_window()
+        try:
+            detail = parse_game(RAW_GAME, "hikaru", include_pgn=True)
+            detail["color"] = "black"
+            viewer = GameViewerDialog(detail, window.analyzer, False, window)
+            try:
+                self.assertEqual(viewer.board.orientation, "black")
+                self.assertEqual(viewer.eval_bar.orientation, "black")
+                self.assertFalse(hasattr(viewer, "coach_button"))
+                self.assertGreater(viewer.eval_bar.sizeHint().width(), 30)
+                self.assertTrue(viewer.eval_label.text().startswith("Eval"))
+                viewer._show_automatic_explanation(
+                    {"ply": 1, "move": "e4", "classification": "mistake"},
+                    {
+                        "headline": "d4 is stronger",
+                        "body": "d4 takes the centre.",
+                        "line": "d4 d5 c4",
+                        "arrows": [{"from": "d2", "to": "d4", "kind": "best"}],
+                        "focus": [],
+                    },
+                )
+                self.assertEqual(viewer.coach_headline.text(), "d4 is stronger")
+                self.assertIn("d4 d5 c4", viewer.guide_label.text())
+                viewer._my_side()
+                self.assertEqual(viewer.board.orientation, "black")
+                text = viewer._format_analysis_entry(
+                    {
+                        "ply": 1,
+                        "move": "e4",
+                        "color": "w",
+                        "classification": "inaccuracy",
+                        "bestMoveSan": "d4",
+                        "explanation": "You gave up the centre.",
+                        "whyBetter": "d4 controls the centre.",
+                        "motifs": ["check"],
+                    }
+                )
+                self.assertNotIn("Centipawn", text)
+                self.assertNotIn("Evaluation before", text)
+                self.assertIn("Why it matters", text)
+            finally:
+                viewer.close()
         finally:
             window.close()
 

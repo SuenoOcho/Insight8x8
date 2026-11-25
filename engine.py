@@ -18,6 +18,7 @@ from chesscom import ChessComError
 from intelligence import (
     classify_loss_for_rating,
     explain_positional_mistake,
+    move_lesson,
     phase_for_ply,
     tactical_motifs,
     why_is_better,
@@ -250,6 +251,7 @@ def build_game_analysis(
                     "score": score,
                     "centipawns": score_value(score),
                     "pv": pv_san,
+                    "pvUci": [str(value) for value in (candidate.get("pv") or []) if value],
                     "capture": flags["capture"],
                     "check": flags["check"],
                 }
@@ -288,6 +290,7 @@ def build_game_analysis(
             "explanation": explain_positional_mistake(before_fen, after_fen, move.get("uci")),
         }
         entry["whyBetter"] = why_is_better(entry)
+        entry["lesson"] = move_lesson(entry)
         entries[ply] = entry
         for text in move_opportunities:
             opportunities.append({"ply": ply, "move": move.get("san"), "color": mover, "text": text})
@@ -307,6 +310,36 @@ def build_game_analysis(
         "summary": summary,
         "opportunities": opportunities,
     }
+
+
+def rebuild_analysis_summary(entries):
+    summary = {
+        "moves": len(entries),
+        "classified": 0,
+        "bestOrGood": 0,
+        "inaccuracies": 0,
+        "mistakes": 0,
+        "blunders": 0,
+        "byColor": {
+            "w": {"bestOrGood": 0, "inaccuracies": 0, "mistakes": 0, "blunders": 0},
+            "b": {"bestOrGood": 0, "inaccuracies": 0, "mistakes": 0, "blunders": 0},
+        },
+    }
+    keys = {
+        "best or good": "bestOrGood",
+        "inaccuracy": "inaccuracies",
+        "mistake": "mistakes",
+        "blunder": "blunders",
+    }
+    for entry in (entries or {}).values():
+        key = keys.get(entry.get("classification"))
+        if not key:
+            continue
+        summary["classified"] += 1
+        summary[key] += 1
+        color = entry.get("color") or "w"
+        summary["byColor"][color][key] += 1
+    return summary
 
 
 class _EngineSession:

@@ -5,7 +5,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "vendor"))
 
 import chess
 from PyQt6.QtCore import Qt, QTimer, QUrl, pyqtSignal
-from PyQt6.QtGui import QDesktopServices, QFont, QShortcut, QKeySequence
+from PyQt6.QtGui import QDesktopServices, QShortcut, QKeySequence
 from PyQt6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -16,7 +16,6 @@ from PyQt6.QtWidgets import (
     QLabel,
     QListWidget,
     QMessageBox,
-    QPlainTextEdit,
     QPushButton,
     QScrollArea,
     QSlider,
@@ -25,20 +24,37 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from engine import format_score, validate_pgn
-from ui_widgets import ChessBoard, captured_pieces
+from coaching import (
+    check_opening_book_with_llm,
+    explain_position_with_coach,
+    softened_classification,
+)
+from engine import format_score, rebuild_analysis_summary, validate_pgn
+from intelligence import move_lesson, position_factors
+from ui_widgets import ChessBoard, EvalBar, captured_pieces
 from utils import fmt_date, fmt_duration, fmt_number, result_text
-from workers import AnalysisWorker
+from workers import AnalysisWorker, FunctionWorker
 
 
 class GameViewerDialog(QWidget):
     favorite_toggled = pyqtSignal(str)
     analysis_saved = pyqtSignal(str, object)
 
-    def __init__(self, game, analyzer, is_favorite=False, parent=None, depth=12, movetime=150):
+    def __init__(
+        self,
+        game,
+        analyzer,
+        is_favorite=False,
+        parent=None,
+        depth=12,
+        movetime=150,
+        coach=None,
+    ):
         super().__init__(parent, Qt.WindowType.Window)
         self.game = game
         self.analyzer = analyzer
+        self.coach = coach
+        self.player_color = "white" if game.get("color") == "white" else "black"
         self.depth = depth
         self.movetime = movetime
         self.positions = []
@@ -48,6 +64,9 @@ class GameViewerDialog(QWidget):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._advance)
         self.worker = None
+        self.book_worker = None
+        self.explain_worker = None
+        self.coach_explanations = {}
         self._closed = False
         self.pgn_error = ""
         self.game_analysis = None
@@ -97,6 +116,14 @@ class GameViewerDialog(QWidget):
         self.positions = positions or [start_fen]
         self.moves = moves
 
+    def _accuracy_for_side(self, side):
+        direct = self.game.get(f"{side}Accuracy")
+        if direct is not None:
+            return direct
+        if side == self.game.get("color"):
+            return self.game.get("accuracy")
+        return self.game.get("opponentAccuracy")
+
     def _build_ui(self, is_favorite):
         root = QVBoxLayout(self)
         root.setContentsMargins(18, 16, 18, 16)
@@ -136,9 +163,24 @@ class GameViewerDialog(QWidget):
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(10)
+        self.eval_bar = EvalBar()
+        self.eval_label = QLabel("Eval —")
+        self.eval_label.setObjectName("sectionLabel")
+        self.eval_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.board = ChessBoard()
+        self.board.orientation = self.player_color
         self.board.setMaximumWidth(620)
-        left_layout.addWidget(self.board, 1)
+        eval_column = QVBoxLayout()
+        eval_column.setContentsMargins(0, 0, 0, 0)
+        eval_column.setSpacing(5)
+        eval_column.addWidget(self.eval_label)
+        eval_column.addWidget(self.eval_bar, 1)
+        board_row = QHBoxLayout()
+        board_row.setContentsMargins(0, 0, 0, 0)
+        board_row.setSpacing(8)
+        board_row.addLayout(eval_column, 0)
+        board_row.addWidget(self.board, 1)
+        left_layout.addLayout(board_row, 1)
         self.status_label = QLabel()
         self.status_label.setObjectName("statusLabel")
         self.captured_label = QLabel()
@@ -182,7 +224,11 @@ class GameViewerDialog(QWidget):
         copy = QPushButton("Copy PGN")
         copy.setObjectName("smallButton")
         copy.clicked.connect(self._copy_pgn)
+        my_side = QPushButton("My side")
+        my_side.setObjectName("smallButton")
+        my_side.clicked.connect(self._my_side)
         tools.addWidget(flip)
+        tools.addWidget(my_side)
         tools.addWidget(download)
         tools.addWidget(copy)
         left_layout.addLayout(tools)
@@ -194,6 +240,31 @@ class GameViewerDialog(QWidget):
         right_layout = QVBoxLayout(right_widget)
         right_layout.setContentsMargins(4, 4, 4, 4)
         right_layout.setSpacing(12)
+        accuracy_frame = QFrame()
+        accuracy_frame.setObjectName("callout")
+        accuracy_row = QHBoxLayout(accuracy_frame)
+        accuracy_row.setContentsMargins(16, 12, 16, 12)
+        accuracy_row.setSpacing(16)
+        for side in ("white", "black"):
+            value = self._accuracy_for_side(side)
+            text = f"{value:.1f}%" if isinstance(value, (int, float)) else "—"
+            side_layout = QVBoxLayout()
+            caption = QLabel(f"{side.upper()} ACCURACY")
+            caption.setObjectName("statTitle")
+            badge = QLabel(text)
+            badge.setObjectName("accuracyBadge")
+            source = QLabel("Chess.com · before analysis")
+            source.setObjectName("muted")
+            side_layout.addWidget(caption)
+            side_layout.addWidget(badge)
+            side_layout.addWidget(source)
+            accuracy_row.addLayout(side_layout, 1)
+            if side == "white":
+                self.white_accuracy_label = badge
+            else:
+                self.black_accuracy_label = badge
+        right_layout.addWidget(accuracy_frame)
+
         meta = QFrame()
         meta.setObjectName("panel")
         meta_grid = QGridLayout(meta)
@@ -234,41 +305,52 @@ class GameViewerDialog(QWidget):
         analysis_frame.setObjectName("panel")
         analysis_layout = QVBoxLayout(analysis_frame)
         analysis_layout.setContentsMargins(14, 12, 14, 12)
-        analysis_head = QLabel("GAME ANALYSIS")
+        analysis_layout.setSpacing(9)
+        analysis_head = QLabel("WHAT JUST HAPPENED")
         analysis_head.setObjectName("sectionLabel")
         analysis_layout.addWidget(analysis_head)
-        opening = self.game.get("opening") or "Unknown opening"
-        eco = self.game.get("eco") or "—"
-        accuracy = self.game.get("accuracy")
-        opponent_accuracy = self.game.get("opponentAccuracy")
-        accuracy_text = f"{accuracy}%" if accuracy is not None else "Not provided by source"
-        opponent_text = f"{opponent_accuracy}%" if opponent_accuracy is not None else "Not provided"
-        self.detail_label = QLabel()
-        self.detail_label.setWordWrap(True)
-        self.detail_label.setText(
-            f"Opening: {opening}\n"
-            f"ECO: {eco}\n"
-            f"Your accuracy: {accuracy_text}\n"
-            f"Opponent accuracy: {opponent_text}"
+
+        coach_frame = QFrame()
+        coach_frame.setObjectName("callout")
+        coach_layout = QVBoxLayout(coach_frame)
+        coach_layout.setContentsMargins(14, 12, 14, 12)
+        coach_layout.setSpacing(6)
+        self.coach_headline = QLabel("Choose a move to see the idea.")
+        self.coach_headline.setObjectName("viewerTitle")
+        self.coach_headline.setWordWrap(True)
+        self.coach_body = QLabel(
+            "Use ← and → or the slider to walk through the game. The explanation appears here automatically."
+        )
+        self.coach_body.setObjectName("coachText")
+        self.coach_body.setWordWrap(True)
+        self.guide_label = QLabel()
+        self.guide_label.setObjectName("muted")
+        self.guide_label.setWordWrap(True)
+        coach_layout.addWidget(self.coach_headline)
+        coach_layout.addWidget(self.coach_body)
+        coach_layout.addWidget(self.guide_label)
+        analysis_layout.addWidget(coach_frame)
+
+        self.detail_label = QLabel(
+            f"{self.game.get('opening') or 'Unknown opening'}"
+            f"{' · ' + self.game.get('eco') if self.game.get('eco') else ''}"
         )
         self.detail_label.setObjectName("muted")
+        self.detail_label.setWordWrap(True)
         analysis_layout.addWidget(self.detail_label)
         self.analysis_note = QLabel(
-            "Stockfish checks every move locally: best move, evaluations, top candidates, variations and tactics."
+            "Read the board first: green shows the stronger move, gold shows the follow-up threat, "
+            "and the bar on the left shows who is better."
         )
         self.analysis_note.setObjectName("muted")
         self.analysis_note.setWordWrap(True)
         analysis_layout.addWidget(self.analysis_note)
+
         self.engine_button = QPushButton("Analyze all moves")
-        self.engine_button.setObjectName("smallButton")
+        self.engine_button.setProperty("primary", True)
         self.engine_button.setEnabled(bool(self.analyzer and self.analyzer.available and self.moves))
         self.engine_button.clicked.connect(self._analyze)
         analysis_layout.addWidget(self.engine_button)
-        self.settings_button = QPushButton("Engine settings…")
-        self.settings_button.setObjectName("smallButton")
-        self.settings_button.setToolTip("Choose the Stockfish executable and analysis depth")
-        self.settings_button.clicked.connect(self._open_engine_settings)
-        analysis_layout.addWidget(self.settings_button)
         self.analysis_progress = QLabel()
         self.analysis_progress.setObjectName("muted")
         self.analysis_progress.setWordWrap(True)
@@ -279,37 +361,40 @@ class GameViewerDialog(QWidget):
         elif not (self.analyzer and self.analyzer.available):
             path_error = getattr(self.analyzer, "path_error", "") if self.analyzer else ""
             message = path_error or "Stockfish is not configured."
-            self.analysis_progress.setText(f"{message} Use Engine settings to locate it.")
+            self.analysis_progress.setText(f"{message} Open Engine options to locate it.")
         else:
             self.analysis_progress.setText(
                 f"Stockfish ready · depth {self.depth} · {self.movetime} ms per position"
             )
         analysis_layout.addWidget(self.analysis_progress)
+
+        options_toggle = QPushButton("Engine options ▾")
+        options_toggle.setObjectName("smallButton")
+        options_toggle.setCheckable(True)
+        self.advanced_frame = QFrame()
+        advanced_layout = QVBoxLayout(self.advanced_frame)
+        advanced_layout.setContentsMargins(0, 0, 0, 0)
+        advanced_layout.setSpacing(6)
+        self.settings_button = QPushButton("Engine settings…")
+        self.settings_button.setObjectName("smallButton")
+        self.settings_button.setToolTip("Choose the Stockfish executable and analysis depth")
+        self.settings_button.clicked.connect(self._open_engine_settings)
+        advanced_layout.addWidget(self.settings_button)
         self.engine_result_label = QLabel()
         self.engine_result_label.setObjectName("engineResult")
         self.engine_result_label.setWordWrap(True)
-        analysis_layout.addWidget(self.engine_result_label)
+        advanced_layout.addWidget(self.engine_result_label)
+        self.advanced_frame.hide()
+        options_toggle.toggled.connect(self.advanced_frame.setVisible)
+        analysis_layout.addWidget(options_toggle)
+        analysis_layout.addWidget(self.advanced_frame)
+
         self.analysis_summary_label = QLabel()
         self.analysis_summary_label.setObjectName("muted")
         self.analysis_summary_label.setWordWrap(True)
         analysis_layout.addWidget(self.analysis_summary_label)
         right_layout.addWidget(analysis_frame)
 
-        pgn_frame = QFrame()
-        pgn_frame.setObjectName("panel")
-        pgn_layout = QVBoxLayout(pgn_frame)
-        pgn_layout.setContentsMargins(10, 10, 10, 10)
-        pgn_head = QLabel("PGN")
-        pgn_head.setObjectName("sectionLabel")
-        pgn_layout.addWidget(pgn_head)
-        self.pgn_box = QPlainTextEdit(self.game.get("pgn") or "")
-        self.pgn_box.setReadOnly(True)
-        self.pgn_box.setMaximumHeight(150)
-        font = QFont("monospace")
-        font.setPointSize(9)
-        self.pgn_box.setFont(font)
-        pgn_layout.addWidget(self.pgn_box)
-        right_layout.addWidget(pgn_frame)
         right_layout.addStretch()
         right.setWidget(right_widget)
         splitter.addWidget(right)
@@ -317,14 +402,32 @@ class GameViewerDialog(QWidget):
         splitter.setStretchFactor(1, 2)
         root.addWidget(splitter)
 
+    @staticmethod
+    def _white_score(score, color):
+        if not score:
+            return {"cp": None, "mate": None}
+        result = dict(score)
+        if color == "b":
+            if result.get("cp") is not None:
+                result["cp"] = -int(result["cp"])
+            if result.get("mate") is not None:
+                result["mate"] = -int(result["mate"])
+        return result
+
     def _set_ply(self, ply):
         if not self.positions:
             return
         self.ply = max(0, min(int(ply), len(self.moves)))
+        entries = (self.game_analysis or {}).get("moves", {})
+        entry = entries.get(self.ply)
+        lesson = entry.get("lesson") if entry else None
+        if not lesson and entry:
+            lesson = move_lesson(entry)
         self.board.set_position(
             self.positions[self.ply],
             self.moves[self.ply - 1] if self.ply else None,
             self.board.orientation,
+            lesson,
         )
         fen = self.positions[self.ply]
         turn = "White" if fen.split(" ")[1] == "w" else "Black"
@@ -345,8 +448,19 @@ class GameViewerDialog(QWidget):
             any_selected = any_selected or selected
         if not any_selected:
             self.move_list.clearSelection()
-        entry = (self.game_analysis or {}).get("moves", {}).get(self.ply)
+        if self.ply == 0:
+            source = entries.get(1) or {}
+            score = self._white_score(source.get("evalBefore"), source.get("color"))
+        else:
+            score = self._white_score(
+                entry.get("evalAfter") if entry else None,
+                entry.get("color") if entry else None,
+            )
+        self.eval_bar.set_evaluation(score, self.board.orientation)
+        self.eval_label.setText(f"Eval {format_score(score)}")
         self.engine_result_label.setText(self._format_analysis_entry(entry) if entry else "")
+        self._show_automatic_explanation(entry, lesson)
+        self._request_auto_explanation(entry, lesson)
 
     def _fill_move_list(self):
         self.move_list.clear()
@@ -405,6 +519,72 @@ class GameViewerDialog(QWidget):
     def _flip(self):
         self.board.orientation = "black" if self.board.orientation == "white" else "white"
         self._set_ply(self.ply)
+
+    def _my_side(self):
+        self.board.orientation = self.player_color
+        self._set_ply(self.ply)
+
+    def _show_automatic_explanation(self, entry, lesson):
+        if not entry:
+            self.coach_headline.setText("Pick a move to see the idea")
+            self.coach_body.setText(
+                "Use ← and → or the slider to walk through the game. The explanation appears here automatically."
+            )
+            self.guide_label.setText("Green shows the stronger move; gold shows the follow-up threat.")
+            return
+        lesson = lesson or {}
+        classification = entry.get("classification") or "the engine line"
+        self.coach_headline.setText(lesson.get("headline") or f"{entry.get('move')} · {classification}")
+        text = (
+            self.coach_explanations.get(self.ply)
+            or lesson.get("body")
+            or entry.get("explanation")
+            or entry.get("whyBetter")
+            or "Follow the highlighted line to see the idea."
+        )
+        self.coach_body.setText(text)
+        line = lesson.get("line") or lesson.get("bestSan") or entry.get("bestMoveSan") or "—"
+        self.guide_label.setText(f"Board line: {line} · Green = stronger move · Gold = follow-up threat")
+
+    def _request_auto_explanation(self, entry, lesson):
+        if not entry or not getattr(self.coach, "available", False):
+            return
+        if self.coach_explanations.get(self.ply):
+            return
+        if self.explain_worker is not None and self.explain_worker.isRunning():
+            return
+        context = {
+            "fen": entry.get("fen") or (self.positions[self.ply] if self.positions else ""),
+            "move": entry.get("move"),
+            "best": entry.get("bestMoveSan"),
+            "opening": self.game.get("opening") or "Unknown opening",
+            "eco": self.game.get("eco") or "",
+            "playerColor": self.game.get("color", ""),
+            "classification": entry.get("classification"),
+            "explanation": (lesson or {}).get("body") or entry.get("explanation"),
+            "factors": position_factors(entry.get("fen") or (self.positions[self.ply] if self.positions else "")),
+        }
+        worker = FunctionWorker(explain_position_with_coach, self.coach, context)
+        self.explain_worker = worker
+        ply = self.ply
+
+        def cleanup(current=worker):
+            if self.explain_worker is current:
+                self.explain_worker = None
+            current.deleteLater()
+
+        worker.succeeded.connect(lambda text: self._apply_auto_explanation(ply, text))
+        worker.failed.connect(lambda message: self._apply_auto_explanation(ply, lesson.get("body") if lesson else ""))
+        worker.finished.connect(cleanup)
+        worker.start()
+
+    def _apply_auto_explanation(self, ply, text):
+        text = str(text or "").strip()
+        if not text:
+            return
+        self.coach_explanations[ply] = text
+        if self.ply == ply:
+            self.coach_body.setText(text)
 
     def _toggle_favorite(self):
         self.favorite_toggled.emit(self.game["id"])
@@ -495,6 +675,58 @@ class GameViewerDialog(QWidget):
         self.game_analysis = result
         self.engine_button.setEnabled(True)
         self.engine_button.setText("Analyze all moves")
+        self.analysis_progress.setText(
+            f"Analysis complete · {len(result.get('moves') or {})} moves · checking opening book…"
+        )
+        if getattr(self.coach, "available", False):
+            self._check_opening_book_async(result)
+            return
+        self._apply_book_check(result)
+        self._analysis_finalized(result)
+
+    def _apply_book_check(self, result):
+        entries = result.get("moves") or {}
+        for ply, entry in entries.items():
+            if not isinstance(entry, dict) or entry.get("phase") != "opening":
+                continue
+            context = {
+                "fen": entry.get("fen"),
+                "uci": entry.get("playedMove"),
+                "bestUci": entry.get("bestMove"),
+                "san": entry.get("move"),
+                "opening": self.game.get("opening"),
+                "eco": self.game.get("eco"),
+                "ply": ply,
+            }
+            info = check_opening_book_with_llm(self.coach, context)
+            if not info or not info.get("book"):
+                continue
+            changes = softened_classification(entry, info)
+            if changes:
+                entry.update(changes)
+            else:
+                entry["bookMove"] = info
+        result["summary"] = rebuild_analysis_summary(entries)
+        return result
+
+    def _check_opening_book_async(self, result):
+        worker = FunctionWorker(self._apply_book_check, result)
+        self.book_worker = worker
+
+        def cleanup(current=worker):
+            if self.book_worker is current:
+                self.book_worker = None
+            current.deleteLater()
+
+        worker.succeeded.connect(lambda updated: self._analysis_finalized(updated))
+        worker.failed.connect(lambda message: self._analysis_finalized(result))
+        worker.finished.connect(cleanup)
+        worker.start()
+
+    def _analysis_finalized(self, result):
+        if self._closed:
+            return
+        self.game_analysis = result
         self.analysis_progress.setText(f"Analysis complete · {len(result.get('moves') or {})} moves")
         self.analysis_summary_label.setText(self._format_analysis_summary(result))
         self.analysis_saved.emit(self.game.get("id", ""), result)
@@ -513,43 +745,24 @@ class GameViewerDialog(QWidget):
             return ""
         color = "White" if entry.get("color") == "w" else "Black"
         suffix = "." if color == "White" else "..."
+        verdict = entry.get("classification") or "unclassified"
         lines = [
-            f"Move {entry['ply']}{suffix} {entry.get('move')} ({color})",
+            f"Move {entry['ply']}{suffix} {entry.get('move')} ({color}) · {verdict}",
             f"Best move: {entry.get('bestMoveSan') or '—'}",
-            f"Evaluation before ({color}): {format_score(entry.get('evalBefore'))}",
-            f"Evaluation after ({color}): {format_score(entry.get('evalAfter'))}",
         ]
-        loss = entry.get("centipawnLoss")
-        classification = entry.get("classification")
-        if loss is not None:
-            lines.append(f"Centipawn loss: {fmt_number(loss)} — {classification}")
-        elif classification:
-            lines.append(f"Classification: {classification}")
+        book = entry.get("bookMove")
+        if book and book.get("book"):
+            lines.append(f"Opening note: {book.get('explanation') or book.get('name')}")
         explanation = entry.get("explanation")
         if explanation:
-            lines.append(f"Why: {explanation}")
+            lines.append(f"Why it matters: {explanation}")
         why_better = entry.get("whyBetter")
         if why_better:
-            lines.append(f"Better move: {why_better}")
+            lines.append(f"Better idea: {why_better}")
         motifs = entry.get("motifs") or []
         if motifs:
-            lines.append("Move themes: " + ", ".join(motifs))
-        candidates = entry.get("candidates") or []
-        if candidates:
-            lines.append("Top 3 candidates:")
-            for candidate in candidates[:3]:
-                pv = " ".join(candidate.get("pv") or [])
-                line = (
-                    f"  {candidate.get('rank')}. {candidate.get('san')} "
-                    f"{format_score(candidate.get('score'))}"
-                )
-                if pv:
-                    line += f"  PV: {pv}"
-                lines.append(line)
-        opportunities = entry.get("tacticalOpportunities") or []
-        if opportunities:
-            lines.append("Tactical opportunities:")
-            lines.extend(f"  • {text}" for text in opportunities)
+            lines.append("Themes: " + ", ".join(motifs))
+        lines.append("Follow the board arrows for the stronger move and its threat.")
         return "\n".join(lines)
 
     def _format_analysis_summary(self, result):
@@ -574,4 +787,7 @@ class GameViewerDialog(QWidget):
     def closeEvent(self, event):
         self.timer.stop()
         self._closed = True
+        for worker in (self.worker, self.book_worker, self.explain_worker):
+            if worker is not None and worker.isRunning():
+                worker.wait(1000)
         event.accept()

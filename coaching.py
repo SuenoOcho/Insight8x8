@@ -11,7 +11,12 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-from intelligence import recurring_weaknesses, why_is_better
+from intelligence import (
+    is_common_opening_move,
+    position_factors,
+    recurring_weaknesses,
+    why_is_better,
+)
 
 LLM_URL_ENV = "INSIGHT8X8_LLM_URL"
 LLM_KEY_ENV = "INSIGHT8X8_LLM_KEY"
@@ -108,6 +113,102 @@ def _extract_json_object(text):
     if not match:
         raise ValueError("No JSON object found.")
     return json.loads(match.group(0))
+
+
+def build_position_prompt(context):
+    context = context or {}
+    lines = [
+        "You are a chess coach. Explain this position in plain language.",
+        "Do not mention centipawns, eval numbers, engine depth, or scores.",
+        "Talk about pawn structure, doubled pawns, king safety, development, central control and threats.",
+        "Keep it under 120 words and sound encouraging.",
+    ]
+    for key, label in (
+        ("fen", "FEN"),
+        ("move", "Move played"),
+        ("best", "Stronger move"),
+        ("opening", "Opening"),
+        ("eco", "ECO"),
+        ("playerColor", "Player color"),
+    ):
+        value = context.get(key)
+        if value:
+            lines.append(f"{label}: {value}")
+    factors = context.get("factors") or []
+    if factors:
+        lines.append("Local observations:")
+        lines.extend(f"- {factor}" for factor in factors[:6])
+    return "\n".join(lines)
+
+
+def explain_position_with_coach(coach, context):
+    """Return a readable position explanation, using the LLM only when configured."""
+    context = context or {}
+    factors = context.get("factors") or position_factors(context.get("fen"))
+    local = context.get("explanation") or " ".join(factors[:3])
+    if not getattr(coach, "available", False):
+        return local + "\n\n(Local explanation · configure an LLM for deeper coaching.)"
+    try:
+        answer = str(coach.generate(build_position_prompt({**context, "factors": factors}))).strip()
+        return answer or local
+    except (RuntimeError, ValueError, TypeError):
+        return local + "\n\n(LLM unavailable; showing local explanation.)"
+
+
+def check_opening_book_with_llm(coach, context):
+    """Ask the LLM whether an early move is book, falling back to local recognition."""
+    context = context or {}
+    local = is_common_opening_move(
+        context.get("fen"),
+        context.get("uci") or context.get("bestUci"),
+        context.get("opening"),
+        context.get("eco"),
+        context.get("ply"),
+    )
+    if local.get("book") and not getattr(coach, "available", False):
+        return local
+    if not getattr(coach, "available", False):
+        return local
+    prompt = "\n".join(
+        [
+            "You are a chess opening expert. Return JSON only with keys book, name, explanation.",
+            "book must be true only if the move is a recognised opening/book move.",
+            "Do not mention centipawns or engine scores.",
+            f"FEN: {context.get('fen', '')}",
+            f"Move: {context.get('san', '')}",
+            f"Opening: {context.get('opening', 'Unknown')}",
+            f"ECO: {context.get('eco', '')}",
+            f"Ply: {context.get('ply', '')}",
+        ]
+    )
+    try:
+        data = _extract_json_object(coach.generate(prompt))
+        book = bool(data.get("book"))
+        explanation = str(data.get("explanation") or "").strip()
+        if not book:
+            return local
+        return {
+            "book": True,
+            "source": "LLM",
+            "name": str(data.get("name") or context.get("opening") or "Recognised opening"),
+            "explanation": explanation or local.get("explanation") or "Standard opening move; not treated as a mistake.",
+        }
+    except (RuntimeError, ValueError, TypeError):
+        return local
+
+
+def softened_classification(entry, book_info):
+    if not book_info or not book_info.get("book"):
+        return None
+    original = entry.get("classification")
+    if original not in ("inaccuracy", "mistake", "blunder"):
+        return None
+    return {
+        "classification": "best or good",
+        "originalClassification": original,
+        "bookMove": book_info,
+        "explanation": book_info.get("explanation") or entry.get("explanation"),
+    }
 
 
 def generate_lessons(weaknesses, llm=None):

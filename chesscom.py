@@ -312,6 +312,8 @@ def parse_game(game, username, include_pgn=False):
         "durationSeconds": duration,
         "accuracy": accuracies.get(color),
         "opponentAccuracy": accuracies.get("black" if color == "white" else "white"),
+        "whiteAccuracy": accuracies.get("white"),
+        "blackAccuracy": accuracies.get("black"),
         "accuracySource": "Chess.com" if color in accuracies else None,
         "supported": _is_supported(game, headers, pgn),
         "event": headers.get("Event") or "",

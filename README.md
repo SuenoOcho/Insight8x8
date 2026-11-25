@@ -6,12 +6,12 @@ Insight8x8 is your personal AI-powered chess analysis and training companion. Ex
 
 - **Username-first onboarding** — paste any public Chess.com username; no password, API key, or account linking is required.
 - **Complete public archive** — monthly archives are downloaded in parallel, normalized, and cached locally for fast repeat visits.
-- **Move-by-move replay** — flip the board, step through the game, jump to any move, watch automatic playback, and inspect captured material.
+- **Move-by-move replay** — the board opens from your side, with **My side** to restore that view, free flip, automatic playback, captured material, and a chess.com-style evaluation bar.
 - **Stockfish analysis** — evaluate every position locally with configurable search depth and time per move.
-- **Plain-language explanations** — each move shows the best move, evaluation before and after, centipawn loss, a rating-aware classification, candidate moves, principal variations, tactical opportunities, and a simple explanation of the positional cost.
+- **Plain-language explanations** — explanations appear automatically as you step through moves: the stronger move, what it attacks, why castling may be delayed, and a highlighted threat line on the board instead of raw centipawn tables.
 - **Chess intelligence** — detect tactical motifs (forks, pins, skewers, sacrifices, promotions, discovered checks), annotate game phases, and aggregate recurring weaknesses across analysed games.
 - **Personal coaching** — build lessons and exercises from your own mistakes, get a plain-language reason why the engine move is better, and track accuracy over time.
-- **Optional LLM adapter** — coaching is local by default; an OpenAI-compatible endpoint can enrich lesson wording only when explicitly configured.
+- **Optional LLM adapter** — coaching is local by default; an OpenAI-compatible endpoint can enrich the automatic explanations and recognize opening/book moves so standard openings are not punished.
 - **Openings and patterns** — see rating progression, results, activity, time-control mix, frequent opponents, and opening win rates. Click an opening or opponent to filter the match history instantly.
 - **Compare players** — check another public Chess.com account and review your direct encounters.
 - **Progress and exports** — view training charts, then export PGN, match-history CSV, favorites, or a complete training report as CSV.
@@ -51,7 +51,7 @@ The suite uses an offscreen Qt platform and a temporary SQLite database; it does
 
 | Shortcut | Action |
 | --- | --- |
-| `Ctrl+1` … `Ctrl+8` | Switch between Overview, Match history, Openings, Compare, Favorites, Training, Progress, and Export |
+| `Ctrl+1` … `Ctrl+8` | Switch between all eight sections; the sidebar shows five primary sections and groups the rest under **More tools** |
 | `Ctrl+F` | Focus the match-history search field |
 | `F5` | Refresh Chess.com archives |
 | `Ctrl+,` | Open Engine settings |
@@ -64,14 +64,15 @@ Right-click a game in Match history to analyze it, toggle its favorite state, or
 
 For each analyzed move, Insight8x8 reports:
 
-1. The move played and the engine's best move.
-2. Evaluations before and after, from the mover's point of view.
-3. Centipawn loss and a rating-aware classification such as `blunder`, `mistake`, `inaccuracy`, or `best/good`.
-4. Up to three candidate moves with short principal variations.
-5. Tactical opportunities such as missed mates or winning material.
-6. Tactical motifs, a positional explanation, and a plain-language "why this move is better" note.
+1. The move played, its rating-aware verdict, and the engine's best move.
+2. An automatic explanation that names the attacked piece, delayed castling, central control, or the follow-up threat.
+3. Green and gold arrows drawn on the board for the stronger move and its continuation.
+4. The evaluation bar beside the board, always oriented to the side you play.
+5. Tactical motifs and opening/book notes when the move is recognized as theory.
 
-Chess.com accuracy is used when the source provides it. Insight8x8 never invents an evaluation: if Stockfish is not configured, the analysis panel explains how to enable it instead of showing fabricated scores.
+Raw evaluations, candidate lists, and tactical opportunity details remain in the stored analysis and training reports, but the replay panel intentionally avoids centipawn tables.
+
+Chess.com accuracy for both White and Black is shown before analysis starts. Insight8x8 never invents an evaluation: if Stockfish is not configured, the analysis panel explains how to enable it instead of showing fabricated scores.
 
 ## Configuration
 
@@ -112,13 +113,13 @@ export INSIGHT8X8_LLM_MODEL="openai/gpt-oss-120b"
 export INSIGHT8X8_LLM_KEY="your-groq-api-key"
 ```
 
-The adapter is only activated when both a URL and an API key are present. If the request fails, Insight8x8 silently falls back to local lessons. The API key entered in the welcome dialog is kept for that session only; `.env` or `INSIGHT8X8_LLM_KEY` is the persistent option.
+The adapter is only activated when both a URL and an API key are present. It enriches the automatic "What just happened" panel and the opening-book check after analysis. If the request fails, Insight8x8 silently falls back to local lessons and local opening heuristics; the error text includes the HTTP status for debugging but never the key. The API key entered in the welcome dialog is kept for that session only; `.env` or `INSIGHT8X8_LLM_KEY` is the persistent option.
 
 ## Project structure
 
 ```text
 insight8x8.py        Main PyQt6 application, pages, onboarding, training, exports, orchestration
-viewers.py           Game replay and analysis dialog
+viewers.py           Game replay, evaluation bar, automatic explanations, threat arrows, and analysis display
 intelligence.py      Rating-aware classifications, motifs, positional explanations, weaknesses
 coaching.py          Local coaching, LLM adapter, progress tracking, training reports
 ui_widgets.py        Board, charts, stat cards, avatars, shared drawing helpers

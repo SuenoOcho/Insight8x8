@@ -169,6 +169,8 @@ def stylesheet():
     QLabel#statValue { color: #edf5ef; font-size: 27px; font-weight: 750; }
     QLabel#statValueSmall { color: #edf5ef; font-size: 17px; font-weight: 650; }
     QLabel#viewerTitle { font-size: 17px; font-weight: 700; }
+    QLabel#accuracyBadge { color: #5fd39a; font-size: 30px; font-weight: 750; }
+    QLabel#coachText { color: #edf5ef; font-size: 14px; line-height: 155%; }
     QLabel#statusLabel { color: #edf5ef; font-size: 13px; font-weight: 600; }
     QLabel#engineResult { color: #e2c17f; font-size: 11px; }
     QLabel#emptyState { color: #a9b9ad; font-size: 13px; padding: 24px; qproperty-wordWrap: true; }
@@ -658,25 +660,37 @@ class Insight8x8App(QMainWindow):
         nav_layout.setContentsMargins(0, 0, 0, 0)
         nav_layout.setSpacing(4)
         self.nav_buttons = {}
-        for index, (key, text) in enumerate(
-            (
-                ("overview", "Overview"),
-                ("games", "Match history"),
-                ("openings", "Openings"),
-                ("compare", "Compare players"),
-                ("favorites", "Favorite games"),
-                ("training", "Training"),
-                ("progress", "Progress"),
-                ("export", "Export center"),
-            ),
-            1,
-        ):
+        nav_order = (
+            ("overview", "Overview"),
+            ("games", "Match history"),
+            ("openings", "Openings"),
+            ("compare", "Compare players"),
+            ("favorites", "Favorite games"),
+            ("training", "Training"),
+            ("progress", "Progress"),
+            ("export", "Export center"),
+        )
+        primary_nav = {"overview", "games", "training", "progress", "export"}
+        for index, (key, text) in enumerate(nav_order, 1):
             button = QPushButton(text)
             button.setObjectName("navButton")
             button.setToolTip(f"{text} (Ctrl+{index})")
             button.clicked.connect(lambda checked=False, value=key: self.show_tab(value))
             self.nav_buttons[key] = button
-            nav_layout.addWidget(button)
+            if key in primary_nav:
+                nav_layout.addWidget(button)
+            else:
+                button.hide()
+        more = QPushButton("More tools ▾")
+        more.setObjectName("navButton")
+        more_menu = QMenu(more)
+        for key in ("openings", "compare", "favorites"):
+            more_menu.addAction(
+                self.nav_buttons[key].text(),
+                lambda checked=False, value=key: self.show_tab(value),
+            )
+        more.setMenu(more_menu)
+        nav_layout.addWidget(more)
         side_layout.addWidget(nav_frame)
         side_layout.addStretch()
         self.engine_status = QLabel()
@@ -709,14 +723,10 @@ class Insight8x8App(QMainWindow):
         head_text.addWidget(self.page_subtitle)
         head.addLayout(head_text)
         head.addStretch()
-        browse = QPushButton("Browse games")
-        browse.setToolTip("Open the searchable match history (Ctrl+2)")
-        browse.clicked.connect(lambda: self.show_tab("games"))
         analyze = QPushButton("Analyze a game →")
         analyze.setProperty("primary", True)
         analyze.setToolTip("Open the most recent game in the replay and analysis viewer")
         analyze.clicked.connect(self._open_first_game)
-        head.addWidget(browse)
         head.addWidget(analyze)
         content.addLayout(head)
         self.tabs = QStackedWidget()
@@ -1103,7 +1113,9 @@ class Insight8x8App(QMainWindow):
             return
         exercise = exercises[index]
         self.training["current"] = exercise
-        self.training_board.set_position(exercise.get("fen", DEMO_FEN))
+        fen = exercise.get("fen", DEMO_FEN)
+        side = "white" if str(fen).split(" ")[1:2] == ["w"] else "black"
+        self.training_board.set_position(fen, orientation=side)
         self.training_prompt.setText(
             f"Exercise {index + 1}/{len(exercises)} · {exercise.get('prompt', '')}"
         )
@@ -1547,15 +1559,15 @@ class Insight8x8App(QMainWindow):
         coach_layout.setContentsMargins(16, 12, 16, 12)
         coach_text = QLabel(
             "LEARN FROM EVERY MOVE\n"
-            "Open a game, run Stockfish, then click any move in the list. You'll see the best "
-            "move, the evaluation swing and the reason the position changed — in plain language."
+            "Open a game, run Stockfish, then step through the moves. The explanation and "
+            "threat arrows appear automatically — no raw engine table to read."
         )
         coach_text.setWordWrap(True)
-        coach_button = QPushButton("Analyze a game →")
-        coach_button.setProperty("primary", True)
-        coach_button.clicked.connect(self._open_first_game)
+        analyze_button = QPushButton("Analyze a game →")
+        analyze_button.setProperty("primary", True)
+        analyze_button.clicked.connect(self._open_first_game)
         coach_layout.addWidget(coach_text, 1)
-        coach_layout.addWidget(coach_button)
+        coach_layout.addWidget(analyze_button)
         self.overview_inner_layout.addWidget(coach)
         grid = QGridLayout()
         grid.setSpacing(10)
@@ -2010,6 +2022,7 @@ class Insight8x8App(QMainWindow):
             self.analyzer,
             game_id in self.favorites,
             self,
+            coach=self.coach,
             **self._analysis_options(),
         )
         viewer.favorite_toggled.connect(self.toggle_favorite)
@@ -2067,14 +2080,15 @@ class Insight8x8App(QMainWindow):
         writer.writerow([
             "Date", "Result", "Color", "Opponent", "Opponent Rating", "Player Rating",
             "Time Class", "Time Control", "Opening", "ECO", "Moves", "Accuracy (%)",
-            "Accuracy Source", "Termination", "URL",
+            "White Accuracy (%)", "Black Accuracy (%)", "Accuracy Source", "Termination", "URL",
         ])
         for game in details:
             row = [
                 game.get("date"), game.get("result"), game.get("color"), game.get("opponent"),
                 game.get("opponentRating"), game.get("playerRating"), game.get("timeClass"),
                 game.get("timeControl"), game.get("opening"), game.get("eco"), game.get("moves"),
-                game.get("accuracy"), game.get("accuracySource"), game.get("termination"), game.get("url"),
+                game.get("accuracy"), game.get("whiteAccuracy"), game.get("blackAccuracy"),
+                game.get("accuracySource"), game.get("termination"), game.get("url"),
             ]
             writer.writerow([csv_safe(value) for value in row])
         return output.getvalue()

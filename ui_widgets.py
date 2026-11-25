@@ -1,4 +1,6 @@
-from PyQt6.QtCore import QPoint, QRect, QSize, Qt, QUrl
+import math
+
+from PyQt6.QtCore import QPoint, QPointF, QRect, QSize, Qt, QUrl
 from PyQt6.QtGui import (
     QBrush,
     QColor,
@@ -281,23 +283,151 @@ def _fen_rows(fen):
     return rows
 
 
+class EvalBar(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.cp = None
+        self.mate = None
+        self.orientation = "white"
+        self.setMinimumWidth(32)
+        self.setMaximumWidth(48)
+        self.setMinimumHeight(220)
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+        self.setToolTip("Evaluation: white at the top when you play White")
+
+    def sizeHint(self):
+        return QSize(42, 360)
+
+    def set_evaluation(self, score=None, orientation=None):
+        score = score or {}
+        self.cp = score.get("cp")
+        self.mate = score.get("mate")
+        if orientation:
+            self.orientation = orientation
+        self.update()
+
+    def clear(self):
+        self.cp = None
+        self.mate = None
+        self.update()
+
+    def _white_share(self):
+        if self.mate is not None:
+            return 0.97 if int(self.mate) > 0 else 0.03
+        try:
+            cp = float(self.cp or 0)
+        except (TypeError, ValueError):
+            cp = 0
+        return 0.5 + 0.5 * math.tanh(cp / 600)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        width, height = self.width(), self.height()
+        if width < 4 or height < 8:
+            return
+        share = self._white_share()
+        white_height = max(2, int(height * share))
+        black_height = height - white_height
+        if self.orientation == "white":
+            white_rect = QRect(0, black_height, width, white_height)
+            black_rect = QRect(0, 0, width, black_height)
+        else:
+            white_rect = QRect(0, 0, width, white_height)
+            black_rect = QRect(0, white_height, width, black_height)
+        painter.fillRect(self.rect(), QColor("#0e1511"))
+        painter.fillRect(white_rect, QColor("#f2f0e6"))
+        painter.fillRect(black_rect, QColor("#252a26"))
+        painter.setPen(QColor("#5fd39a"))
+        painter.drawRect(self.rect().adjusted(0, 0, -1, -1))
+        font = QFont("DejaVu Sans")
+        font.setPointSize(max(7, min(11, width - 8)))
+        font.setWeight(QFont.Weight.Bold)
+        painter.setFont(font)
+        if self.mate is not None:
+            mate_text = f"M{abs(int(self.mate))}"
+            white_text, black_text = (mate_text, "") if int(self.mate) > 0 else ("", mate_text)
+        else:
+            try:
+                value = abs(float(self.cp or 0)) / 100
+            except (TypeError, ValueError):
+                value = 0
+            text = "0" if value == 0 else f"{value:.1f}"
+            white_text, black_text = text, text
+        if white_rect.height() > 24 and white_text:
+            painter.setPen(QColor("#101712"))
+            painter.drawText(white_rect, Qt.AlignmentFlag.AlignCenter, white_text)
+        if black_rect.height() > 24 and black_text:
+            painter.setPen(QColor("#f2f0e6"))
+            painter.drawText(black_rect, Qt.AlignmentFlag.AlignCenter, black_text)
+
+
 class ChessBoard(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
         self.last_move = None
         self.orientation = "white"
+        self.guide = {}
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
     def sizeHint(self):
         return QSize(520, 520)
 
-    def set_position(self, fen, last_move=None, orientation=None):
+    def set_position(self, fen, last_move=None, orientation=None, guide=None):
         self.fen = fen
         self.last_move = last_move
         if orientation:
             self.orientation = orientation
+        self.guide = guide or {}
         self.update()
+
+    def _display_rect(self, square_name, ox, oy, square_size):
+        if len(square_name) < 2 or square_name[0] not in FILES:
+            return None
+        source_col = FILES.index(square_name[0])
+        try:
+            rank = int(square_name[1])
+        except ValueError:
+            return None
+        source_row = 8 - rank
+        if source_row < 0 or source_row > 7:
+            return None
+        display_col = source_col if self.orientation == "white" else 7 - source_col
+        display_row = source_row if self.orientation == "white" else 7 - source_row
+        return QRect(
+            int(ox + display_col * square_size),
+            int(oy + display_row * square_size),
+            int(square_size + 0.6),
+            int(square_size + 0.6),
+        )
+
+    def _draw_arrows(self, painter, ox, oy, square_size):
+        for arrow in self.guide.get("arrows") or []:
+            start = self._display_rect(str(arrow.get("from") or ""), ox, oy, square_size)
+            end = self._display_rect(str(arrow.get("to") or ""), ox, oy, square_size)
+            if start is None or end is None:
+                continue
+            start_point = QPointF(start.center().x(), start.center().y())
+            end_point = QPointF(end.center().x(), end.center().y())
+            threat = arrow.get("kind") == "threat"
+            color = QColor("#e2c17f" if threat else "#5fd39a")
+            color.setAlpha(210)
+            pen = QPen(color, max(3, int(square_size * (0.045 if threat else 0.06))))
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            painter.setPen(pen)
+            painter.drawLine(start_point, end_point)
+            dx = end_point.x() - start_point.x()
+            dy = end_point.y() - start_point.y()
+            length = max(1.0, (dx * dx + dy * dy) ** 0.5)
+            ux, uy = dx / length, dy / length
+            wing = max(6, square_size * 0.22)
+            back = max(4, square_size * 0.12)
+            tip = QPointF(end_point.x() - ux * back, end_point.y() - uy * back)
+            left = QPointF(tip.x() - uy * wing, tip.y() + ux * wing)
+            right = QPointF(tip.x() + uy * wing, tip.y() - ux * wing)
+            painter.drawLine(end_point, left)
+            painter.drawLine(end_point, right)
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -309,6 +439,7 @@ class ChessBoard(QWidget):
         ox = (self.width() - side) / 2
         oy = (self.height() - side) / 2
         rows = _fen_rows(self.fen)
+        focus_squares = set(self.guide.get("focus") or [])
         font = QFont("DejaVu Sans")
         font.setPointSize(max(12, int(square * 0.62)))
         coord_font = QFont()
@@ -328,6 +459,10 @@ class ChessBoard(QWidget):
                 )
                 light = (rank + source_col) % 2 == 0
                 painter.fillRect(rect, QColor("#cfd8c9") if light else QColor("#4d765d"))
+                if square_name in focus_squares:
+                    overlay = QColor("#5fd39a")
+                    overlay.setAlpha(90)
+                    painter.fillRect(rect, overlay)
                 if self.last_move and square_name in (self.last_move.get("from"), self.last_move.get("to")):
                     pen = QPen(QColor("#d8b46a"), 3)
                     painter.setPen(pen)
@@ -342,6 +477,7 @@ class ChessBoard(QWidget):
                     painter.drawText(rect.adjusted(4, 0, 0, -3), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignBottom, str(rank))
                 if display_row == 7:
                     painter.drawText(rect.adjusted(0, 2, -4, 0), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop, FILES[source_col])
+        self._draw_arrows(painter, ox, oy, square)
 
 
 def captured_pieces(moves, ply=None):

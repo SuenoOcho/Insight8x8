@@ -308,6 +308,194 @@ def _space_score(board, color):
     return score
 
 
+def position_factors(fen):
+    """Return concise positional talking points for a FEN."""
+    try:
+        board = chess.Board(fen)
+    except (TypeError, ValueError, AssertionError):
+        return ["The position could not be read from the supplied FEN."]
+    factors = []
+    for color, label in ((chess.WHITE, "White"), (chess.BLACK, "Black")):
+        centre = _centre_control(board, color)
+        if centre >= 3:
+            factors.append(f"{label} controls {centre} of the four central squares.")
+        elif centre == 0:
+            factors.append(f"{label} has no direct central control.")
+        doubled = _doubled_pawn_files(board, color)
+        if doubled:
+            files = ", ".join(chr(ord("a") + index) for index in doubled)
+            factors.append(f"{label} has doubled pawns on {files}.")
+        shield = _king_safety(board, color)
+        if shield <= 1:
+            factors.append(f"{label} king has limited pawn cover.")
+        developed = _developed_minors(board, color)
+        if developed >= 2:
+            factors.append(f"{label} has {developed} developed minor pieces.")
+        elif developed == 0 and board.fullmove_number > 8:
+            factors.append(f"{label} minors are still on the back rank.")
+    return factors[:6] or ["The position is roughly balanced with no obvious structural flaw."]
+
+
+def _doubled_pawn_files(board, color):
+    files = [chess.square_file(square) for square in board.pieces(chess.PAWN, color)]
+    return sorted({file_index for file_index in files if files.count(file_index) > 1})
+
+
+def is_common_opening_move(fen, uci, opening=None, eco=None, ply=None):
+    """Recognise standard early moves without treating them as blunders."""
+    try:
+        board = chess.Board(fen)
+        move = chess.Move.from_uci(str(uci or ""))
+        if move not in board.legal_moves:
+            return {"book": False}
+    except (TypeError, ValueError, AssertionError):
+        return {"book": False}
+    if ply is not None and int(ply) > 24:
+        return {"book": False}
+    san = board.san(move)
+    common = {
+        "Nf3", "Nf6", "e4", "e5", "d4", "d5", "c4", "c5",
+        "Bf4", "Bg5", "Bf5", "Bg4", "O-O", "g3", "g6", "e3", "d3",
+    }
+    if san not in common:
+        return {"book": False}
+    name = str(opening or "a recognised opening system").strip()
+    code = str(eco or "").strip()
+    label = f"{name} ({code})" if code and name != "a recognised opening system" else name
+    return {
+        "book": True,
+        "san": san,
+        "name": name,
+        "explanation": (
+            f"{san} is a standard move in {label}. It follows opening principles, "
+            "so it should not be treated as a blunder."
+        ),
+    }
+
+
+def move_lesson(entry):
+    """Build an automatic, concrete lesson plus board arrows for one analysed move."""
+    if not isinstance(entry, dict):
+        return None
+    fen = entry.get("fen")
+    best_uci = entry.get("bestMove")
+    if not fen or not best_uci:
+        return None
+    try:
+        before = chess.Board(str(fen))
+        best = chess.Move.from_uci(str(best_uci))
+        if best not in before.legal_moves:
+            return None
+    except (TypeError, ValueError, AssertionError):
+        return None
+
+    best_san = before.san(best)
+    after = before.copy()
+    after.push(best)
+    mover = not after.turn
+    facts = []
+    focus = []
+    arrows = []
+
+    captured = before.piece_at(best.to_square)
+    if captured and captured.color != mover:
+        facts.append(f"it wins the {chess.piece_name(captured.piece_type)} on {chess.square_name(best.to_square)}")
+        focus.append(chess.square_name(best.to_square))
+    if after.is_check():
+        facts.append("it gives check")
+
+    attacked = []
+    for square, piece in after.piece_map().items():
+        if piece.color == mover or piece.piece_type == chess.KING:
+            continue
+        if after.attackers(mover, square):
+            attacked.append((PIECE_VALUE[piece.piece_type], piece, square, bool(after.attackers(not mover, square))))
+    attacked.sort(key=lambda item: item[0], reverse=True)
+    if attacked:
+        _, piece, square, defended = attacked[0]
+        name = chess.piece_name(piece.piece_type)
+        square_name = chess.square_name(square)
+        facts.append(f"it attacks the {name} on {square_name}")
+        focus.append(square_name)
+        if not defended:
+            facts.append(f"the {name} has no easy defender")
+
+    if best.to_square in CENTRE:
+        facts.append("it takes the centre")
+    moved_piece = before.piece_at(best.from_square)
+    if moved_piece and moved_piece.piece_type in (chess.KNIGHT, chess.BISHOP):
+        facts.append("it develops a minor piece")
+    if _castling_route_attacked(before, best, mover):
+        facts.append("castling is delayed because the king route is covered")
+    if not facts:
+        facts.extend(position_factors(str(fen))[:2] or ["it improves coordination"])
+
+    played_san = str(entry.get("move") or "")
+    if "O-O" in played_san:
+        headline = f"Castling is natural, but {best_san} is stronger"
+    elif captured and captured.color != mover:
+        headline = f"{best_san} is the cleaner capture"
+    elif entry.get("classification") in ("mistake", "blunder"):
+        headline = f"{best_san} keeps control"
+    else:
+        headline = f"{best_san} is the clearer plan"
+
+    pv_uci = []
+    for candidate in entry.get("candidates") or []:
+        if isinstance(candidate, dict) and candidate.get("pvUci"):
+            pv_uci = [str(value) for value in candidate["pvUci"][:4]]
+            break
+    if not pv_uci:
+        pv_uci = [str(best_uci)]
+    for index, uci in enumerate(pv_uci):
+        if len(uci) < 4:
+            continue
+        arrows.append(
+            {
+                "from": uci[:2],
+                "to": uci[2:4],
+                "kind": "best" if index == 0 else "threat",
+            }
+        )
+    if not arrows:
+        arrows = [{"from": chess.square_name(best.from_square), "to": chess.square_name(best.to_square), "kind": "best"}]
+
+    body = f"{headline} because " + ", ".join(facts[:2]) + "."
+    body += " Follow the highlighted line to see the threat."
+    return {
+        "headline": headline,
+        "body": body,
+        "bestSan": best_san,
+        "facts": facts,
+        "focus": list(dict.fromkeys(focus)),
+        "arrows": arrows,
+        "line": " ".join(pv_uci[:4]),
+    }
+
+
+def _castling_route_attacked(before, best, mover):
+    after = before.copy()
+    after.push(best)
+    opponent = not mover
+    if not after.has_castling_rights(opponent):
+        return False
+    king_square = after.king(opponent)
+    if king_square is None:
+        return False
+    rank = chess.square_rank(king_square)
+    routes = (
+        (after.has_kingside_castling_rights(opponent), (5, 6)),
+        (after.has_queenside_castling_rights(opponent), (3, 2, 1)),
+    )
+    for available, files in routes:
+        if not available:
+            continue
+        squares = [chess.square(file_index, rank) for file_index in files]
+        if any(after.is_attacked_by(mover, square) for square in squares):
+            return True
+    return False
+
+
 def recurring_weaknesses(analyses):
     """Aggregate repeated mistakes across analysed games into coaching themes."""
     if not analyses:
@@ -329,6 +517,8 @@ def recurring_weaknesses(analyses):
         move_entries = moves.values() if isinstance(moves, dict) else moves
         for index, entry in enumerate(move_entries, start=1):
             if not isinstance(entry, dict):
+                continue
+            if entry.get("bookMove"):
                 continue
             classification = entry.get("classification")
             if classification in ("blunder", "mistake"):
